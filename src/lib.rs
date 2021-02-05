@@ -23,17 +23,19 @@ pub enum RotationMode {
 }
 
 enum StateFuture {
-    FileReady(Pin<Box<File>>),
-    Swapping,
-    Rotating(Pin<Box<dyn Future<Output = Result<Pin<Box<File>>, Error>>>>),
+    FileReady(usize, usize),
+    Rotating(Pin<Box<dyn Future<Output = Result<Pin<Box<File>>, Error>> + Send>>),
 }
 
 pub struct RotatingFile {
     path: PathBuf,
     rotation: RotationMode,
     state: Cell<StateFuture>,
-    bytes: usize,
-    lines: usize,
+    file: Option<Pin<Box<File>>>,
+}
+
+fn countlines(buf: &[u8]) -> usize {
+    buf.iter().filter(|x| **x == b'\n').count()
 }
 
 impl RotatingFile {
@@ -47,9 +49,13 @@ impl RotatingFile {
                 if n == 0 {
                     break;
                 }
-                lines_at += buf[..n].iter().filter(|x| **x == b'\n').count();
+                lines_at += countlines(&buf[..n]);
                 bytes_at += n;
             }
+        }
+
+        if let Some(dir) = path.as_ref().parent() {
+            tokio::fs::create_dir_all(dir).await?;
         }
 
         let file = Box::pin(
@@ -61,40 +67,32 @@ impl RotatingFile {
                 .await?,
         );
 
-        let shouldrotate = match mode {
-            RotationMode::Lines(l) => lines_at >= l,
-            RotationMode::Bytes(b) => bytes_at >= b,
-        };
-        let state = if shouldrotate {
-            StateFuture::Rotating(Self::rotate(path.as_ref().to_path_buf(), file).boxed())
-        } else {
-            StateFuture::FileReady(file)
-        };
-
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             rotation: mode,
-            lines: lines_at,
-            bytes: bytes_at,
-            state: Cell::new(state),
+            state: Cell::new(StateFuture::FileReady(lines_at, bytes_at)),
+            file: Some(file),
         })
     }
 
-    async fn rotate(path: PathBuf, file: Pin<Box<File>>) -> Result<Pin<Box<File>>, Error> {
+    fn get_rotate_dest(path: &Path) -> PathBuf {
+        let mut path = path.to_path_buf();
+        let extension = path.extension().unwrap().to_owned();
+        path.set_extension("");
+        let mut filename = path.file_name().unwrap().to_owned(); // Must be file in constructor
+        filename.push(Local::now().format("-%Y-%m-%d_%H-%M-%S").to_string());
+        path.set_file_name(filename);
+        path.set_extension(extension);
+        println!("{:?}", path);
+        path
+    }
+
+    async fn rotate_fut(path: PathBuf, file: Pin<Box<File>>) -> Result<Pin<Box<File>>, Error> {
         file.sync_all().await?;
 
-        let dir = if path.is_file() {
-            if let Some(p) = path.parent() {
-                PathBuf::from(p)
-            } else {
-                PathBuf::from(".")
-            }
-        } else {
-            path.clone()
-        };
-        let target_path = dir.join(Local::now().format("%Y-%m-%d_%H-%M-%S.log").to_string());
-        tokio::fs::rename(&path, target_path.clone()).await?;
-        Self::compress(target_path.clone()).await?;
+        let target_path = Self::get_rotate_dest(&path);
+        tokio::fs::rename(&path, &target_path).await?;
+        Self::compress(&target_path).await?;
         Ok(Box::pin(
             OpenOptions::new()
                 .write(true)
@@ -105,9 +103,12 @@ impl RotatingFile {
         ))
     }
 
-    async fn compress(path: PathBuf) -> Result<(), Error> {
-        let mut outputfile = path.clone();
-        outputfile.set_extension("log.gz");
+    async fn compress(path: &Path) -> Result<(), Error> {
+        let mut outputfile = path.to_path_buf();
+        let mut extension = outputfile.extension().unwrap().to_owned();
+        extension.push(".gz");
+        outputfile.set_extension(extension);
+
         let mut inputfile = File::open(&path).await?;
         let mut gz = GzEncoder::new(
             std::fs::File::create(outputfile.clone())?,
@@ -127,25 +128,10 @@ impl RotatingFile {
         Ok(())
     }
 
-    fn rotate_if_needed(&mut self) {
-        let shouldrotate = match self.rotation {
-            RotationMode::Bytes(b) => self.bytes >= b,
-            RotationMode::Lines(l) => self.lines >= l,
-        };
-
-        if shouldrotate {
-            match self.state.replace(StateFuture::Swapping) {
-                StateFuture::Swapping => {}
-                StateFuture::FileReady(file) => {
-                    self.state.replace(StateFuture::Rotating(
-                        Self::rotate(self.path.clone(), file).boxed(),
-                    ));
-                }
-                StateFuture::Rotating(m) => {
-                    self.state.replace(StateFuture::Rotating(m));
-                }
-            }
-        }
+    fn rotate(&mut self) {
+        self.state.replace(StateFuture::Rotating(
+            Self::rotate_fut(self.path.clone(), self.file.take().unwrap()).boxed(),
+        ));
     }
 }
 
@@ -155,25 +141,31 @@ impl AsyncWrite for RotatingFile {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
-        let mut me = self.get_mut();
-        me.rotate_if_needed();
+        let me = self.get_mut();
 
         loop {
             match me.state.get_mut() {
-                StateFuture::FileReady(ref mut file) => {
-                    let ret = Pin::as_mut(file).poll_write(cx, buf);
-                    if let Poll::Ready(Ok(n)) = ret {
-                        me.bytes += n;
-                        me.lines += buf[..n].iter().filter(|x| **x == b'\n').count();
+                StateFuture::FileReady(ref mut lines, ref mut bytes) => {
+                    let shouldrotate = match me.rotation {
+                        RotationMode::Lines(l) => *lines >= l,
+                        RotationMode::Bytes(b) => *bytes >= b,
+                    };
+                    if shouldrotate {
+                        me.rotate();
+                        continue;
+                    } else {
+                        let ret = Pin::as_mut(me.file.as_mut().unwrap()).poll_write(cx, buf);
+                        if let Poll::Ready(Ok(n)) = ret {
+                            *bytes += n;
+                            *lines += countlines(&buf[..n]);
+                        }
+                        return ret;
                     }
-                    return ret;
                 }
-                StateFuture::Swapping => panic!("Should never happen"),
                 StateFuture::Rotating(ref mut fut) => match Pin::as_mut(fut).poll(cx) {
                     Poll::Ready(Ok(file)) => {
-                        me.lines = 0;
-                        me.bytes = 0;
-                        me.state.replace(StateFuture::FileReady(file));
+                        me.file = Some(file);
+                        me.state.replace(StateFuture::FileReady(0, 0));
                         continue;
                     }
                     Poll::Pending => return Poll::Pending,
@@ -186,34 +178,34 @@ impl AsyncWrite for RotatingFile {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let me = self.get_mut();
         match me.state.get_mut() {
-            StateFuture::FileReady(ref mut file) => Pin::as_mut(file).poll_flush(cx),
+            StateFuture::FileReady(_, _) => Pin::as_mut(me.file.as_mut().unwrap()).poll_flush(cx),
             StateFuture::Rotating(ref mut fut) => match Pin::as_mut(fut).poll(cx) {
                 Poll::Ready(Ok(file)) => {
-                    me.lines = 0;
-                    me.bytes = 0;
-                    me.state.replace(StateFuture::FileReady(file));
+                    me.file = Some(file);
+                    me.state.replace(StateFuture::FileReady(0, 0));
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,
             },
-            StateFuture::Swapping => panic!("Should never happen"),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         let me = self.get_mut();
         match me.state.get_mut() {
-            StateFuture::FileReady(ref mut file) => Pin::as_mut(file).poll_shutdown(cx),
+            StateFuture::FileReady(_, _) => {
+                Pin::as_mut(me.file.as_mut().unwrap()).poll_shutdown(cx)
+            }
             StateFuture::Rotating(ref mut fut) => match Pin::as_mut(fut).poll(cx) {
                 Poll::Ready(Ok(file)) => {
-                    me.state.replace(StateFuture::FileReady(file));
+                    me.file = Some(file);
+                    me.state.replace(StateFuture::FileReady(0, 0));
                     Poll::Ready(Ok(()))
                 }
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                 Poll::Pending => Poll::Pending,
             },
-            StateFuture::Swapping => panic!("Should never happen"),
         }
     }
 }
@@ -224,8 +216,13 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
+    async fn enforce_file_path() {
+        let file = RotatingFile::new(".", RotationMode::Lines(1)).await;
+        assert!(file.is_err());
+    }
+
+    #[tokio::test]
     async fn basic_lines() {
-        tokio::fs::create_dir_all("./out").await.unwrap();
         let mut file = RotatingFile::new("./out/testfile1.log", RotationMode::Lines(1))
             .await
             .unwrap();
@@ -236,12 +233,26 @@ mod tests {
 
     #[tokio::test]
     async fn basic_bytes() {
-        tokio::fs::create_dir_all("./out1").await.unwrap();
         let mut file = RotatingFile::new("./out1/testfile.log", RotationMode::Bytes(2))
             .await
             .unwrap();
         file.write_all(b"112233").await.unwrap();
         file.write_all(b"112233").await.unwrap();
         file.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send() {
+        tokio::spawn(async {
+            tokio::fs::create_dir_all("./out1").await.unwrap();
+            let file = RotatingFile::new("./out1/testfile.log", RotationMode::Bytes(2))
+                .await
+                .unwrap();
+            let mut buf = tokio::io::BufWriter::with_capacity(500, file);
+            buf.write_all(b"112233").await.unwrap();
+            buf.write_all(b"112233").await.unwrap();
+            let mut file = buf.into_inner();
+            file.flush().await.unwrap();
+        });
     }
 }
